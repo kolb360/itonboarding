@@ -1,0 +1,596 @@
+"""
+IT Onboarding Script for Atlassian Products - Windows Compatible Version
+Creates users in Jira Service Desk, Jira, and Confluence using REST APIs
+
+Requirements:
+pip install requests python-dotenv
+
+Setup:
+1. Create a .env file with your credentials
+2. Get API tokens from Atlassian account settings
+3. Configure the user data and group assignments
+"""
+
+import requests
+import json
+import time
+import logging
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from requests.auth import HTTPBasicAuth
+import os
+import sys
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Set console encoding for Windows
+if sys.platform.startswith('win'):
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
+# Configure logging without emojis for Windows compatibility
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('onboarding.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+@dataclass
+class NewUser:
+    """Data class for new user information"""
+    email: str
+    display_name: str
+    username: str
+    department: str = ""
+    job_title: str = ""
+    phone: str = ""
+    
+class AtlassianOnboarding:
+    """Main class for Atlassian user onboarding"""
+    
+    def __init__(self):
+        # Load configuration from environment variables
+        self.base_url = os.getenv('ATLASSIAN_BASE_URL')
+        self.email = os.getenv('ATLASSIAN_EMAIL')
+        self.api_token = os.getenv('ATLASSIAN_API_TOKEN')
+        
+        # Debug output
+        print("DEBUG - Environment Variables:")
+        print(f"  Base URL: '{self.base_url}'")
+        print(f"  Email: '{self.email}'")
+        print(f"  API Token: '{self.api_token[:10] if self.api_token else None}...{self.api_token[-4:] if self.api_token and len(self.api_token) > 10 else self.api_token}'")
+        print()
+        
+        if not all([self.base_url, self.email, self.api_token]):
+            missing = []
+            if not self.base_url: missing.append("ATLASSIAN_BASE_URL")
+            if not self.email: missing.append("ATLASSIAN_EMAIL") 
+            if not self.api_token: missing.append("ATLASSIAN_API_TOKEN")
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}. Check your .env file.")
+        
+        # Remove trailing slash from base_url if present
+        self.base_url = self.base_url.rstrip('/')
+        
+        self.auth = HTTPBasicAuth(self.email, self.api_token)
+        self.session = requests.Session()
+        self.session.auth = self.auth
+        
+        # Default headers
+        self.headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        # Test authentication first
+        self._test_authentication()
+        
+        # Default groups for new users
+        self.default_jira_groups = ['jira-users', 'jira-servicedesk-users']
+        self.default_confluence_groups = ['confluence-users']
+    
+    def _test_authentication(self):
+        """Test if authentication credentials are valid"""
+        try:
+            # Test Jira authentication
+            test_url = f"{self.base_url}/rest/api/3/myself"
+            print(f"Testing connection to: {test_url}")
+            
+            response = self.session.get(test_url, headers=self.headers, timeout=30)
+            
+            print(f"Response status code: {response.status_code}")
+            print(f"Response headers: {dict(response.headers)}")
+            
+            if response.status_code == 401:
+                print(f"401 Response body: {response.text}")
+                raise ValueError(
+                    "Authentication failed (401 Unauthorized). Please check:\n"
+                    "1. Your API token is correct and not expired\n"
+                    "2. Your email address matches your Atlassian account\n"
+                    "3. Your account has the required permissions\n"
+                    "4. Try generating a new API token"
+                )
+            elif response.status_code == 403:
+                print(f"403 Response body: {response.text}")
+                raise ValueError(
+                    "Access forbidden (403). Your account doesn't have sufficient permissions.\n"
+                    "You need Jira Administrator or User Management permissions."
+                )
+            elif response.status_code == 404:
+                print(f"404 Response body: {response.text}")
+                raise ValueError(
+                    "Endpoint not found (404). Please check:\n"
+                    "1. Your Atlassian URL is correct\n"
+                    "2. You're using Atlassian Cloud (not Server/Data Center)\n"
+                    "3. The instance exists and is accessible"
+                )
+            elif response.status_code != 200:
+                print(f"Unexpected response: {response.status_code}")
+                print(f"Response body: {response.text}")
+                raise ValueError(f"Connection test failed: {response.status_code} - {response.text}")
+            
+            user_info = response.json()
+            print(f"SUCCESS: Connected as {user_info.get('displayName', 'Unknown User')}")
+            print(f"Account ID: {user_info.get('accountId', 'Unknown')}")
+            print(f"Account Type: {user_info.get('accountType', 'Unknown')}")
+            logging.info(f"Authentication successful. Connected as: {user_info.get('displayName', 'Unknown')}")
+            
+        except requests.exceptions.Timeout:
+            raise ValueError("Connection timeout. Please check your network connection and try again.")
+        except requests.exceptions.ConnectionError as e:
+            raise ValueError(f"Connection error: {str(e)}. Please check your network and URL.")
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Request error: {str(e)}")
+        except json.JSONDecodeError:
+            raise ValueError("Invalid response format. Please check your Atlassian URL.")
+        except Exception as e:
+            raise ValueError(f"Authentication test failed: {str(e)}")
+    
+    def create_jira_user(self, user: NewUser) -> Optional[Dict]:
+        """Create user in Jira/Jira Service Desk"""
+        url = f"{self.base_url}/rest/api/3/user"
+        
+        payload = {
+            "emailAddress": user.email,
+            "displayName": user.display_name,
+            "notification": True,
+            "products": ["jira-servicedesk", "jira-software"]
+        }
+        
+        try:
+            response = self.session.post(url, headers=self.headers, data=json.dumps(payload))
+            
+            if response.status_code == 201:
+                user_data = response.json()
+                print(f"SUCCESS: Created Jira user: {user.email}")
+                logging.info(f"SUCCESS: Created Jira user: {user.email}")
+                
+                # Add user to default groups
+                self._add_user_to_jira_groups(user_data['accountId'], self.default_jira_groups)
+                
+                return user_data
+            elif response.status_code == 400:
+                # User might already exist
+                error_data = response.json()
+                if "already exists" in str(error_data).lower():
+                    print(f"WARNING: Jira user already exists: {user.email}")
+                    logging.warning(f"WARNING: Jira user already exists: {user.email}")
+                    # Try to get existing user
+                    existing_user = self._get_existing_jira_user(user.email)
+                    return existing_user
+                else:
+                    print(f"ERROR: Failed to create Jira user: {response.status_code} - {response.text}")
+                    logging.error(f"ERROR: Failed to create Jira user: {response.status_code} - {response.text}")
+                    return None
+            else:
+                print(f"ERROR: Failed to create Jira user: {response.status_code} - {response.text}")
+                logging.error(f"ERROR: Failed to create Jira user: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            print(f"ERROR: Exception creating Jira user: {str(e)}")
+            logging.error(f"ERROR: Exception creating Jira user: {str(e)}")
+            return None
+    
+    def _get_existing_jira_user(self, email: str) -> Optional[Dict]:
+        """Get existing Jira user by email"""
+        try:
+            url = f"{self.base_url}/rest/api/3/user/search"
+            params = {'query': email}
+            response = self.session.get(url, headers=self.headers, params=params)
+            
+            if response.status_code == 200:
+                users = response.json()
+                for user in users:
+                    if user.get('emailAddress', '').lower() == email.lower():
+                        return user
+            return None
+        except Exception:
+            return None
+    
+    def create_confluence_user(self, user: NewUser) -> Optional[Dict]:
+        """Create user in Confluence"""
+        url = f"{self.base_url}/wiki/rest/api/user"
+        
+        payload = {
+            "name": user.username,
+            "displayName": user.display_name,
+            "email": user.email
+        }
+        
+        try:
+            response = self.session.post(url, headers=self.headers, data=json.dumps(payload))
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                print(f"SUCCESS: Created Confluence user: {user.email}")
+                logging.info(f"SUCCESS: Created Confluence user: {user.email}")
+                
+                # Add user to default groups
+                self._add_user_to_confluence_groups(user.username, self.default_confluence_groups)
+                
+                return user_data
+            else:
+                print(f"ERROR: Failed to create Confluence user: {response.status_code}")
+                logging.error(f"ERROR: Failed to create Confluence user: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            print(f"ERROR: Exception creating Confluence user: {str(e)}")
+            logging.error(f"ERROR: Exception creating Confluence user: {str(e)}")
+            return None
+    
+    def _add_user_to_jira_groups(self, account_id: str, groups: List[str]):
+        """Add user to Jira groups"""
+        for group in groups:
+            url = f"{self.base_url}/rest/api/3/group/user"
+            payload = {
+                "groupname": group,
+                "accountId": account_id
+            }
+            
+            try:
+                response = self.session.post(url, headers=self.headers, data=json.dumps(payload))
+                if response.status_code == 201:
+                    print(f"SUCCESS: Added user to Jira group: {group}")
+                    logging.info(f"SUCCESS: Added user to Jira group: {group}")
+                else:
+                    print(f"WARNING: Failed to add user to Jira group {group}: {response.text}")
+                    logging.warning(f"WARNING: Failed to add user to Jira group {group}: {response.text}")
+            except Exception as e:
+                print(f"ERROR: Adding user to Jira group {group}: {str(e)}")
+                logging.error(f"ERROR: Adding user to Jira group {group}: {str(e)}")
+            
+            time.sleep(0.5)  # Rate limiting
+    
+    def _add_user_to_confluence_groups(self, username: str, groups: List[str]):
+        """Add user to Confluence groups"""
+        for group in groups:
+            url = f"{self.base_url}/wiki/rest/api/group/{group}/member"
+            payload = {
+                "name": username
+            }
+            
+            try:
+                response = self.session.post(url, headers=self.headers, data=json.dumps(payload))
+                if response.status_code == 200:
+                    print(f"SUCCESS: Added user to Confluence group: {group}")
+                    logging.info(f"SUCCESS: Added user to Confluence group: {group}")
+                else:
+                    print(f"WARNING: Failed to add user to Confluence group {group}: {response.text}")
+                    logging.warning(f"WARNING: Failed to add user to Confluence group {group}: {response.text}")
+            except Exception as e:
+                print(f"ERROR: Adding user to Confluence group {group}: {str(e)}")
+                logging.error(f"ERROR: Adding user to Confluence group {group}: {str(e)}")
+            
+            time.sleep(0.5)  # Rate limiting
+    
+    def create_jira_issue_for_onboarding(self, user: NewUser) -> Optional[str]:
+        """Create a Jira issue to track the onboarding process"""
+        url = f"{self.base_url}/rest/api/3/issue"
+        
+        payload = {
+            "fields": {
+                "project": {"key": "HR"},  # Adjust project key as needed
+                "summary": f"Onboarding: {user.display_name} ({user.email})",
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"New hire onboarding for {user.display_name}\n\n"
+                                           f"Email: {user.email}\n"
+                                           f"Department: {user.department}\n"
+                                           f"Job Title: {user.job_title}\n"
+                                           f"Phone: {user.phone}\n\n"
+                                           f"Tasks:\n"
+                                           f"• Jira account created\n"
+                                           f"• Confluence account created\n"
+                                           f"• Welcome email sent\n"
+                                           f"• Access permissions configured"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "issuetype": {"name": "Task"},
+                "assignee": {"emailAddress": self.email},
+                "labels": ["onboarding", "new-hire"],
+                "priority": {"name": "Medium"}
+            }
+        }
+        
+        try:
+            response = self.session.post(url, headers=self.headers, data=json.dumps(payload))
+            if response.status_code == 201:
+                issue_data = response.json()
+                issue_key = issue_data['key']
+                print(f"SUCCESS: Created onboarding issue: {issue_key}")
+                logging.info(f"SUCCESS: Created onboarding issue: {issue_key}")
+                return issue_key
+            else:
+                print(f"WARNING: Failed to create onboarding issue: {response.text}")
+                logging.error(f"WARNING: Failed to create onboarding issue: {response.text}")
+                return None
+        except Exception as e:
+            print(f"ERROR: Creating onboarding issue: {str(e)}")
+            logging.error(f"ERROR: Creating onboarding issue: {str(e)}")
+            return None
+    
+    def onboard_user(self, user: NewUser) -> Dict[str, any]:
+        """Complete onboarding process for a new user"""
+        print(f"STARTING: Onboarding for {user.display_name} ({user.email})")
+        logging.info(f"STARTING: Onboarding for {user.display_name} ({user.email})")
+        
+        results = {
+            'user': user,
+            'jira_user': None,
+            'confluence_user': None,
+            'onboarding_issue': None,
+            'success': False
+        }
+        
+        # Create Jira user (this also creates Jira Service Desk access)
+        jira_user = self.create_jira_user(user)
+        if jira_user:
+            results['jira_user'] = jira_user
+            time.sleep(2)  # Wait between API calls
+        
+        # Create Confluence user
+        confluence_user = self.create_confluence_user(user)
+        if confluence_user:
+            results['confluence_user'] = confluence_user
+            time.sleep(2)
+        
+        # Create tracking issue (optional, don't fail if this doesn't work)
+        issue_key = self.create_jira_issue_for_onboarding(user)
+        if issue_key:
+            results['onboarding_issue'] = issue_key
+        
+        # Determine overall success (at least Jira user creation must succeed)
+        results['success'] = bool(jira_user)
+        
+        if results['success']:
+            print(f"SUCCESS: Onboarding completed for {user.display_name}")
+            logging.info(f"SUCCESS: Onboarding completed for {user.display_name}")
+        else:
+            print(f"FAILED: Onboarding failed for {user.display_name}")
+            logging.error(f"FAILED: Onboarding failed for {user.display_name}")
+        
+        return results
+    
+    def bulk_onboard_users(self, users: List[NewUser]) -> List[Dict]:
+        """Onboard multiple users"""
+        results = []
+        
+        for user in users:
+            result = self.onboard_user(user)
+            results.append(result)
+            time.sleep(5)  # Wait between users to avoid rate limiting
+        
+        return results
+
+def prompt_for_user_info() -> NewUser:
+    """Prompt user for new hire information"""
+    print("\n" + "="*60)
+    print("IT ONBOARDING - NEW USER CREATION")
+    print("="*60)
+    print("Please enter the new hire's information:")
+    print("(Required fields marked with *)")
+    print()
+    
+    # Required fields
+    while True:
+        email = input("Email Address *: ").strip()
+        if email and '@' in email:
+            break
+        print("ERROR: Please enter a valid email address")
+    
+    while True:
+        first_name = input("First Name *: ").strip()
+        if first_name:
+            break
+        print("ERROR: First name is required")
+    
+    while True:
+        last_name = input("Last Name *: ").strip()
+        if last_name:
+            break
+        print("ERROR: Last name is required")
+    
+    # Auto-suggest username from email
+    suggested_username = email.split('@')[0].replace('.', '').lower()
+    username = input(f"Username (press Enter for '{suggested_username}'): ").strip()
+    if not username:
+        username = suggested_username
+    
+    display_name = f"{first_name} {last_name}"
+    
+    # Optional fields
+    print("\nOptional Information:")
+    department = input("Department: ").strip()
+    job_title = input("Job Title: ").strip()
+    phone = input("Phone Number: ").strip()
+    
+    # Show summary
+    print("\n" + "="*60)
+    print("USER INFORMATION SUMMARY")
+    print("="*60)
+    print(f"Name: {display_name}")
+    print(f"Email: {email}")
+    print(f"Username: {username}")
+    print(f"Department: {department or 'Not specified'}")
+    print(f"Job Title: {job_title or 'Not specified'}")
+    print(f"Phone: {phone or 'Not specified'}")
+    print("="*60)
+    
+    # Confirmation
+    while True:
+        confirm = input("\nIs this information correct? (y/n): ").strip().lower()
+        if confirm in ['y', 'yes']:
+            break
+        elif confirm in ['n', 'no']:
+            print("Please restart and enter the information again.")
+            return prompt_for_user_info()
+        else:
+            print("Please enter 'y' for yes or 'n' for no")
+    
+    return NewUser(
+        email=email,
+        display_name=display_name,
+        username=username,
+        department=department,
+        job_title=job_title,
+        phone=phone
+    )
+
+def prompt_for_multiple_users() -> List[NewUser]:
+    """Prompt for multiple users"""
+    users = []
+    
+    while True:
+        user = prompt_for_user_info()
+        users.append(user)
+        
+        while True:
+            another = input("\nAdd another user? (y/n): ").strip().lower()
+            if another in ['y', 'yes']:
+                break
+            elif another in ['n', 'no']:
+                return users
+            else:
+                print("Please enter 'y' for yes or 'n' for no")
+
+def main():
+    """Interactive onboarding script"""
+    
+    print("Welcome to the Atlassian IT Onboarding System!")
+    print("This script will create user accounts in Jira, Jira Service Desk, and Confluence.")
+    print()
+    
+    # Check environment setup
+    try:
+        onboarding = AtlassianOnboarding()
+    except ValueError as e:
+        print(f"CONFIGURATION ERROR: {e}")
+        print("\n" + "="*60)
+        print("TROUBLESHOOTING GUIDE")
+        print("="*60)
+        print("1. Create .env file with:")
+        print("   ATLASSIAN_BASE_URL=https://yourcompany.atlassian.net")
+        print("   ATLASSIAN_EMAIL=your-admin-email@company.com") 
+        print("   ATLASSIAN_API_TOKEN=your-api-token-here")
+        print("\n2. Get API Token:")
+        print("   - Go to https://id.atlassian.com/manage-profile/security/api-tokens")
+        print("   - Create new token")
+        print("   - Copy token to .env file")
+        print("\n3. Check Permissions:")
+        print("   - You need Jira Administrator rights")
+        print("   - You need Confluence Administrator rights")
+        print("   - You need User Management permissions")
+        print("="*60)
+        return
+    except Exception as e:
+        print(f"CONNECTION ERROR: {e}")
+        print("Please check your credentials and network connection.")
+        return
+    
+    # Ask for single or multiple users
+    print("\n" + "="*60)
+    while True:
+        mode = input("Onboard single user or multiple users? (single/multiple): ").strip().lower()
+        if mode in ['single', 's', '1']:
+            users = [prompt_for_user_info()]
+            break
+        elif mode in ['multiple', 'multi', 'm', '2']:
+            users = prompt_for_multiple_users()
+            break
+        else:
+            print("Please enter 'single' or 'multiple'")
+    
+    # Final confirmation
+    print(f"\nReady to onboard {len(users)} user(s)")
+    while True:
+        proceed = input("Proceed with onboarding? (y/n): ").strip().lower()
+        if proceed in ['y', 'yes']:
+            break
+        elif proceed in ['n', 'no']:
+            print("Onboarding cancelled.")
+            return
+        else:
+            print("Please enter 'y' for yes or 'n' for no")
+    
+    # Execute onboarding
+    print("\n" + "="*60)
+    print("STARTING ONBOARDING PROCESS")
+    print("="*60)
+    
+    try:
+        if len(users) == 1:
+            result = onboarding.onboard_user(users[0])
+            print("\n" + "="*60)
+            if result['success']:
+                print("ONBOARDING COMPLETED SUCCESSFULLY!")
+                print(f"User: {result['user'].display_name}")
+                print(f"Email: {result['user'].email}")
+                if result['onboarding_issue']:
+                    print(f"Tracking Issue: {result['onboarding_issue']}")
+            else:
+                print("ONBOARDING FAILED")
+                print("Please check the logs for details.")
+        else:
+            results = onboarding.bulk_onboard_users(users)
+            successful = sum(1 for r in results if r['success'])
+            
+            print("\n" + "="*60)
+            print("BULK ONBOARDING RESULTS")
+            print("="*60)
+            print(f"Successful: {successful}/{len(results)} users")
+            
+            if successful < len(results):
+                print("\nFailed users:")
+                for result in results:
+                    if not result['success']:
+                        print(f"   • {result['user'].display_name} ({result['user'].email})")
+            
+            print("\nCheck the logs for detailed information.")
+            
+    except Exception as e:
+        print(f"\nFatal error during onboarding: {str(e)}")
+        logging.error(f"Fatal error: {str(e)}")
+    
+    print("\n" + "="*60)
+    print("Onboarding process completed. Check onboarding.log for details.")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
