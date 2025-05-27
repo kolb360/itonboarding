@@ -39,17 +39,19 @@ jobs:
         id: fetch_issue
         with:
           script: |
+            // On manual dispatch, read the issue number from inputs
+            const issueNumber = context.payload.inputs.issue_number;
             const issue = await github.rest.issues.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.inputs.issue_number
+              issue_number: issueNumber
             });
             return issue.data;
 
       - name: Prepare issue data
         run: |
           mkdir -p data
-          # Export fetched or event issue into env
+          # Set ISSUE_BODY, ISSUE_TITLE, ISSUE_NUMBER based on dispatch or event
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
             echo "${{ steps.fetch_issue.outputs.result.body }}" >> $GITHUB_ENV
@@ -67,7 +69,7 @@ jobs:
       - name: Extract issue data and create XML
         run: |
           cat << 'EOF' > process_onboarding.js
-          // (Same Node.js script as before, escaped fields etc.)
+          // (Node.js script unchanged)
           EOF
           node process_onboarding.js
         env:
@@ -100,13 +102,13 @@ jobs:
               `**View file:** [data/work_orders.xml](${fileLink})\n\n` +
               `*Processed at ${new Date().toISOString()}*`;
             await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+              issue_number: (context.event_name === 'workflow_dispatch' ? parseInt(context.payload.inputs.issue_number) : context.issue.number),
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: comment
             });
             await github.rest.issues.addLabels({
-              issue_number: context.issue.number,
+              issue_number: (context.event_name === 'workflow_dispatch' ? parseInt(context.payload.inputs.issue_number) : context.issue.number),
               owner: context.repo.owner,
               repo: context.repo.repo,
               labels: ['✅ Processed']
@@ -118,15 +120,16 @@ jobs:
         with:
           script: |
             const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+            const targetIssue = (context.event_name === 'workflow_dispatch' ? parseInt(context.payload.inputs.issue_number) : context.issue.number);
             await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+              issue_number: targetIssue,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: `## ❌ Processing Failed\n\n` +
                     `There was an error processing this onboarding request. Check [workflow run](${repoUrl}/actions) for details.`
             });
             await github.rest.issues.addLabels({
-              issue_number: context.issue.number,
+              issue_number: targetIssue,
               owner: context.repo.owner,
               repo: context.repo.repo,
               labels: ['❌ Failed', '🚨 Manual Review Needed']
